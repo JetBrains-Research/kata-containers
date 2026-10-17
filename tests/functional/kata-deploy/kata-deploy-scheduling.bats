@@ -15,6 +15,10 @@
 # asserted at the end of this file. Pod-level affinity (podAffinity,
 # podAntiAffinity) stays DaemonSet-only, because the dispatcher pins each per-node
 # Job to a node via spec.template.spec.nodeName, making it a scheduling no-op.
+#
+# RuntimeClass tolerations (runtimeClasses.tolerations and the per-shim
+# shims.<name>.runtimeClass.tolerations) are for workloads, not for kata-deploy's
+# own pods: they land on the generated RuntimeClasses, asserted at the very end.
 
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 
@@ -110,6 +114,18 @@ count_required_node_selector_terms() {
 		in_req && /- match(Expressions|Fields):/ { count++ }
 		END { print count + 0 }
 	'
+}
+
+# Print the toleration keys of the RuntimeClass named ${1} in ${RENDERED}, in
+# order and comma-separated (e.g. "first-key,second-key"). Built-in and custom
+# RuntimeClasses indent their list items differently, hence the `[ -]*`.
+runtimeclass_toleration_keys() {
+	awk -v name="${1}" '
+		/^---$/ { if (found) exit; doc = ""; next }
+		{ doc = doc $0 "\n" }
+		$0 == "  name: " name { found = 1 }
+		END { if (found) printf "%s", doc }
+	' "${RENDERED}" | sed -n 's/^[ -]*key: //p' | paste -sd, -
 }
 
 # =============================================================================
@@ -895,4 +911,91 @@ EOF
 		--set job.ttlSecondsAfterFinished=30
 	[ "${status}" -ne 0 ]
 	echo "${output}" | grep -q "too short for the dispatcher to observe"
+}
+
+# =============================================================================
+# RuntimeClass tolerations (no cluster required)
+# =============================================================================
+
+@test "Helm template: RuntimeClasses have no tolerations by default" {
+	render_chart --show-only templates/runtimeclasses.yaml
+
+	refute_match "$(cat "${RENDERED}")" "tolerations:"
+}
+
+@test "Helm template: runtimeClasses.tolerations are applied to every RuntimeClass" {
+	# debug=true also renders the kata-<shim>-debug classes, which need them too.
+	render_chart --show-only templates/runtimeclasses.yaml \
+		--set debug=true \
+		--set 'runtimeClasses.tolerations[0].key=katacontainers.io/dedicated' \
+		--set 'runtimeClasses.tolerations[0].operator=Exists' \
+		--set 'runtimeClasses.tolerations[0].effect=NoSchedule'
+
+	local classes tolerated
+	classes=$(grep -c '^kind: RuntimeClass$' "${RENDERED}")
+	tolerated=$(grep -c 'key: katacontainers.io/dedicated' "${RENDERED}")
+
+	[[ "${classes}" -gt 0 ]]
+	[[ "${tolerated}" -eq "${classes}" ]]
+}
+
+@test "Helm template: per-shim RuntimeClass tolerations are appended for that shim only" {
+	local values_file
+	values_file=$(mktemp)
+	cat > "${values_file}" <<EOF
+runtimeClasses:
+  tolerations:
+    - key: katacontainers.io/dedicated
+      operator: Exists
+      effect: NoSchedule
+shims:
+  qemu-snp:
+    runtimeClass:
+      tolerations:
+        - key: confidential
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+EOF
+
+	render_chart --show-only templates/runtimeclasses.yaml -f "${values_file}"
+	rm -f "${values_file}"
+
+	# The global entries come first, then the shim's own.
+	[[ "$(runtimeclass_toleration_keys kata-qemu-snp)" == "katacontainers.io/dedicated,confidential" ]]
+	# Every other shim gets the global entries alone.
+	[[ "$(runtimeclass_toleration_keys kata-qemu)" == "katacontainers.io/dedicated" ]]
+}
+
+@test "Helm template: custom RuntimeClasses inherit runtimeClasses.tolerations" {
+	local values_file
+	values_file=$(mktemp)
+	cat > "${values_file}" <<EOF
+runtimeClasses:
+  tolerations:
+    - key: katacontainers.io/dedicated
+      operator: Exists
+      effect: NoSchedule
+customRuntimes:
+  enabled: true
+  runtimes:
+    my-runtime:
+      baseConfig: "qemu"
+      runtimeClass: |
+        kind: RuntimeClass
+        apiVersion: node.k8s.io/v1
+        metadata:
+          name: kata-my-runtime
+        handler: kata-my-runtime
+        scheduling:
+          tolerations:
+            - key: example.com/own
+              operator: Exists
+EOF
+
+	render_chart --show-only templates/custom-runtimes.yaml -f "${values_file}"
+	rm -f "${values_file}"
+
+	# The global entries come first, then the ones the custom RuntimeClass declares.
+	[[ "$(runtimeclass_toleration_keys kata-my-runtime)" == "katacontainers.io/dedicated,example.com/own" ]]
 }
